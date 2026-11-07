@@ -1,0 +1,82 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build-tools
+        run: |
+          cd /tmp
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q commandlinetools-linux-11076708_latest.zip -d sdk
+          mkdir -p sdk/cmdline-tools
+          mv sdk/cmdline-tools sdk/tmp && mkdir -p sdk/cmdline-tools && mv sdk/tmp sdk/cmdline-tools/latest
+          yes | sdk/cmdline-tools/latest/bin/sdkmanager --licenses >/dev/null 2>&1 || true
+          sdk/cmdline-tools/latest/bin/sdkmanager --install "build-tools;34.0.0" "platforms;android-34" >/dev/null
+          echo "/tmp/sdk/build-tools/34.0.0" >> $GITHUB_PATH
+
+      - name: Build api stub
+        run: |
+          AJ=/tmp/sdk/platforms/android-34/android.jar
+          mkdir -p stub-classes
+          javac -source 8 -target 8 -nowarn -cp "$AJ" -d stub-classes $(find api-stub -name "*.java")
+          cd stub-classes && jar cf ../api-stub.jar . && cd ..
+          ls -l api-stub.jar
+
+      - name: Compile module
+        run: |
+          AJ=/tmp/sdk/platforms/android-34/android.jar
+          mkdir -p bc bd
+          javac -source 8 -target 8 -nowarn -cp "$AJ:api-stub.jar" -d bc src/com/eta/harkpro/MainHook.java
+          d8 --min-api 32 --lib "$AJ" --classpath api-stub.jar --output bd bc/com/eta/harkpro/*.class
+          dexdump -f bd/classes.dex | grep "Class descriptor"
+
+      - name: Verify
+        run: |
+          dexdump -f bd/classes.dex | grep "Class descriptor" | grep -q "com/eta/harkpro/MainHook" || { echo "no MainHook"; exit 1; }
+          if dexdump -f bd/classes.dex | grep "Class descriptor" | grep -q "de/robv/android/xposed"; then
+            echo "BAD: xposed api inside dex"; exit 1
+          fi
+          echo OK
+
+      - name: Templates
+        run: |
+          mkdir -p template/assets
+          base64 -d manifest.b64 > template/AndroidManifest.xml
+          base64 -d arsc.b64 > template/resources.arsc
+          printf 'com.eta.harkpro.MainHook' > template/assets/xposed_init
+
+      - name: Package and sign
+        run: |
+          mkdir -p ap
+          cp -r template/. ap/
+          cp bd/classes.dex ap/
+          cd ap && zip -qr ../u.apk .
+          cd ..
+          keytool -genkeypair -keystore r.jks -alias h -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass harkpro -keypass harkpro -dname "CN=HarkPro,C=CN"
+          zipalign -p 4 u.apk a.apk
+          apksigner sign --ks r.jks --ks-pass pass:harkpro --key-pass pass:harkpro --out HarkProUnlock.apk a.apk
+
+      - name: Commit APK
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f HarkProUnlock.apk
+          git commit -m "build apk" || true
+          git push origin main || true
